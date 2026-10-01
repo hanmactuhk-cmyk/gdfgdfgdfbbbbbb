@@ -1,11 +1,17 @@
+```cpp
 #pragma once
+
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_core/juce_core.h>
+#include <atomic>
+#include <cstdint>
+#include <algorithm>
 
 class AudioRecorder : public juce::Thread
 {
 public:
-    AudioRecorder() : juce::Thread("HNStudioAudioRecorderThread")
+    AudioRecorder()
+        : juce::Thread("HNStudioAudioRecorderThread")
     {
     }
 
@@ -14,36 +20,59 @@ public:
         stopRecording();
     }
 
-    void startRecording(const juce::File& destinationFolder, double sampleRate, int numChannels = 2)
+    void startRecording(const juce::File& destinationFolder,
+                        double sampleRate,
+                        int numChannels = 2)
     {
         stopRecording();
 
         currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
-        channels = numChannels;
+        channels = juce::jmax(1, numChannels);
 
         if (!destinationFolder.exists())
             destinationFolder.createDirectory();
 
         auto now = juce::Time::getCurrentTime();
-        juce::String fileName = "HNStudio_Record_" + now.formatted("%Y-%m-%d_%H-%M-%S") + ".wav";
+
+        juce::String fileName =
+            "HNStudio_Record_"
+            + now.formatted("%Y-%m-%d_%H-%M-%S")
+            + ".wav";
+
         currentRecordFile = destinationFolder.getChildFile(fileName);
 
-        fifo.setSize(numChannels, (int)(currentSampleRate * 5.0)); // 5 seconds buffer
-        abstractFifo.setTotalSize(fifo.getNumSamples());
+        const int bufferSize =
+            juce::jmax(1024, (int)(currentSampleRate * 5.0));
+
+        fifo.setSize(channels, bufferSize);
+        abstractFifo.setTotalSize(bufferSize);
         abstractFifo.reset();
 
-        std::unique_ptr<juce::FileOutputStream> fileStream(currentRecordFile.createOutputStream());
+        std::unique_ptr<juce::FileOutputStream> fileStream(
+            currentRecordFile.createOutputStream());
+
         if (fileStream != nullptr)
         {
             juce::WavAudioFormat wavFormat;
-            writer.reset(wavFormat.createWriterFor(fileStream.get(), currentSampleRate,
-                                                   (unsigned int)channels, 24, {}, 0));
+
+            writer.reset(
+                wavFormat.createWriterFor(
+                    fileStream.get(),
+                    currentSampleRate,
+                    (unsigned int)channels,
+                    24,
+                    {},
+                    0));
+
             if (writer != nullptr)
             {
+                // AudioFormatWriter takes ownership of the stream.
                 fileStream.release();
-                isRecordingActive = true;
-                isPausedState = false;
-                recordedSamplesCount = 0;
+
+                isRecordingActive.store(true, std::memory_order_release);
+                isPausedState.store(false, std::memory_order_release);
+                recordedSamplesCount.store(0, std::memory_order_release);
+
                 startThread();
             }
         }
@@ -51,58 +80,114 @@ public:
 
     void pauseRecording()
     {
-        isPausedState = true;
+        isPausedState.store(true, std::memory_order_release);
     }
 
     void resumeRecording()
     {
-        isPausedState = false;
+        isPausedState.store(false, std::memory_order_release);
     }
 
     void stopRecording()
     {
-        if (isRecordingActive)
+        if (isRecordingActive.load(std::memory_order_acquire))
         {
-            isRecordingActive = false;
+            isRecordingActive.store(false, std::memory_order_release);
+
             stopThread(3000);
+
             writer.reset();
         }
     }
 
-    bool isRecording() const noexcept { return isRecordingActive && !isPausedState; }
-    bool isPaused() const noexcept { return isRecordingActive && isPausedState; }
+    bool isRecording() const noexcept
+    {
+        return isRecordingActive.load(std::memory_order_acquire)
+            && !isPausedState.load(std::memory_order_acquire);
+    }
+
+    bool isPaused() const noexcept
+    {
+        return isRecordingActive.load(std::memory_order_acquire)
+            && isPausedState.load(std::memory_order_acquire);
+    }
 
     double getRecordedSeconds() const noexcept
     {
-        return (double)recordedSamplesCount.get() / (currentSampleRate > 0.0 ? currentSampleRate : 44100.0);
+        const auto samples =
+            recordedSamplesCount.load(std::memory_order_acquire);
+
+        const double rate =
+            currentSampleRate > 0.0
+                ? currentSampleRate
+                : 44100.0;
+
+        return static_cast<double>(samples) / rate;
     }
 
     juce::String getFormattedTime() const
     {
-        int totalSec = (int)getRecordedSeconds();
-        int mins = totalSec / 60;
-        int secs = totalSec % 60;
-        return juce::String::formatted("%02d:%02d", mins, secs);
+        const int totalSec =
+            static_cast<int>(getRecordedSeconds());
+
+        const int mins = totalSec / 60;
+        const int secs = totalSec % 60;
+
+        return juce::String::formatted(
+            "%02d:%02d",
+            mins,
+            secs);
     }
 
-    juce::File getCurrentFile() const { return currentRecordFile; }
-
-    // Called on audio thread - strictly lock-free!
-    void processAudioBlock(const juce::AudioBuffer<float>& buffer)
+    juce::File getCurrentFile() const
     {
-        if (!isRecordingActive || isPausedState)
+        return currentRecordFile;
+    }
+
+    // Called from the audio thread.
+    // This function does not perform file I/O.
+    void processAudioBlock(
+        const juce::AudioBuffer<float>& buffer)
+    {
+        if (!isRecordingActive.load(std::memory_order_acquire)
+            || isPausedState.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
+        const int numSamples = buffer.getNumSamples();
+
+        if (numSamples <= 0 || buffer.getNumChannels() <= 0)
             return;
 
-        int numSamples = buffer.getNumSamples();
-        int start1, size1, start2, size2;
-        abstractFifo.prepareToWrite(numSamples, start1, size1, start2, size2);
+        int start1 = 0;
+        int size1 = 0;
+        int start2 = 0;
+        int size2 = 0;
+
+        abstractFifo.prepareToWrite(
+            numSamples,
+            start1,
+            size1,
+            start2,
+            size2);
 
         if (size1 > 0)
         {
             for (int ch = 0; ch < channels; ++ch)
             {
-                int srcCh = std::min(ch, buffer.getNumChannels() - 1);
-                fifo.copyFrom(ch, start1, buffer, srcCh, 0, size1);
+                const int srcCh =
+                    juce::jmin(
+                        ch,
+                        buffer.getNumChannels() - 1);
+
+                fifo.copyFrom(
+                    ch,
+                    start1,
+                    buffer,
+                    srcCh,
+                    0,
+                    size1);
             }
         }
 
@@ -110,14 +195,33 @@ public:
         {
             for (int ch = 0; ch < channels; ++ch)
             {
-                int srcCh = std::min(ch, buffer.getNumChannels() - 1);
-                fifo.copyFrom(ch, start2, buffer, srcCh, size1, size2);
+                const int srcCh =
+                    juce::jmin(
+                        ch,
+                        buffer.getNumChannels() - 1);
+
+                fifo.copyFrom(
+                    ch,
+                    start2,
+                    buffer,
+                    srcCh,
+                    size1,
+                    size2);
             }
         }
 
-        abstractFifo.finishedWrite(size1 + size2);
-        recordedSamplesCount += numSamples;
-        notify();
+        const int written = size1 + size2;
+
+        if (written > 0)
+        {
+            abstractFifo.finishedWrite(written);
+
+            recordedSamplesCount.fetch_add(
+                written,
+                std::memory_order_relaxed);
+
+            notify();
+        }
     }
 
 private:
@@ -125,45 +229,103 @@ private:
     {
         while (!threadShouldExit())
         {
-            int numReady = abstractFifo.getNumReady();
-            if (numReady > 256 || !isRecordingActive)
+            const int numReady =
+                abstractFifo.getNumReady();
+
+            if (numReady > 256
+                || !isRecordingActive.load(
+                    std::memory_order_acquire))
             {
-                int start1, size1, start2, size2;
-                abstractFifo.prepareToRead(numReady, start1, size1, start2, size2);
+                int start1 = 0;
+                int size1 = 0;
+                int start2 = 0;
+                int size2 = 0;
+
+                abstractFifo.prepareToRead(
+                    numReady,
+                    start1,
+                    size1,
+                    start2,
+                    size2);
 
                 if (writer != nullptr)
                 {
                     if (size1 > 0)
-                        writer->writeFromAudioSampleBuffer(fifo, start1, size1);
+                    {
+                        writer->writeFromAudioSampleBuffer(
+                            fifo,
+                            start1,
+                            size1);
+                    }
+
                     if (size2 > 0)
-                        writer->writeFromAudioSampleBuffer(fifo, start2, size2);
+                    {
+                        writer->writeFromAudioSampleBuffer(
+                            fifo,
+                            start2,
+                            size2);
+                    }
                 }
 
-                abstractFifo.finishedRead(size1 + size2);
+                abstractFifo.finishedRead(
+                    size1 + size2);
             }
             else
             {
                 wait(20);
             }
 
-            if (!isRecordingActive && abstractFifo.getNumReady() == 0)
+            if (!isRecordingActive.load(
+                    std::memory_order_acquire)
+                && abstractFifo.getNumReady() == 0)
+            {
                 break;
+            }
         }
 
-        // Flush remaining
-        int remaining = abstractFifo.getNumReady();
+        // Flush any remaining samples before the thread exits.
+        const int remaining =
+            abstractFifo.getNumReady();
+
         if (remaining > 0 && writer != nullptr)
         {
-            int start1, size1, start2, size2;
-            abstractFifo.prepareToRead(remaining, start1, size1, start2, size2);
-            if (size1 > 0) writer->writeFromAudioSampleBuffer(fifo, start1, size1);
-            if (size2 > 0) writer->writeFromAudioSampleBuffer(fifo, start2, size2);
-            abstractFifo.finishedRead(size1 + size2);
+            int start1 = 0;
+            int size1 = 0;
+            int start2 = 0;
+            int size2 = 0;
+
+            abstractFifo.prepareToRead(
+                remaining,
+                start1,
+                size1,
+                start2,
+                size2);
+
+            if (size1 > 0)
+            {
+                writer->writeFromAudioSampleBuffer(
+                    fifo,
+                    start1,
+                    size1);
+            }
+
+            if (size2 > 0)
+            {
+                writer->writeFromAudioSampleBuffer(
+                    fifo,
+                    start2,
+                    size2);
+            }
+
+            abstractFifo.finishedRead(
+                size1 + size2);
         }
     }
 
     std::unique_ptr<juce::AudioFormatWriter> writer;
+
     juce::File currentRecordFile;
+
     double currentSampleRate = 44100.0;
     int channels = 2;
 
@@ -176,3 +338,4 @@ private:
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioRecorder)
 };
+```
