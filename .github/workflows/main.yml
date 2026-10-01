@@ -1,5 +1,4 @@
-```yaml
-name: Build HNStudio Musik AI Windows
+name: Build HNStudio Musik AI
 
 on:
   workflow_dispatch:
@@ -8,304 +7,75 @@ on:
       - main
       - master
 
-permissions:
-  contents: read
-
 jobs:
-  build-windows:
-    name: Build Windows x64
+  build:
     runs-on: windows-latest
 
     steps:
-      # ==========================================
-      # 1. DOWNLOAD SOURCE
-      # ==========================================
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ==========================================
-      # 2. KIỂM TRA CẤU TRÚC PROJECT
-      # ==========================================
-      - name: Verify project structure
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "Checking project structure..."
-          Write-Host "======================================"
-
-          if (!(Test-Path "CMakeLists.txt")) {
-              Write-Error "ERROR: CMakeLists.txt not found!"
-              exit 1
-          }
-
-          if (!(Test-Path "Source")) {
-              Write-Error "ERROR: Source folder not found!"
-              exit 1
-          }
-
-          Write-Host "CMakeLists.txt: OK"
-          Write-Host "Source folder: OK"
-
-          if (Test-Path "Assets") {
-              Write-Host "Assets folder: OK"
-          } else {
-              Write-Host "Assets folder: not found - continuing..."
-          }
-
-      # ==========================================
-      # 3. MSVC
-      # ==========================================
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ==========================================
-      # 4. KIỂM TRA COMPILER
-      # ==========================================
-      - name: Check compiler
+      - name: Check project
         shell: pwsh
         run: |
-          Write-Host "======================================"
-          Write-Host "Checking MSVC compiler..."
-          Write-Host "======================================"
-
-          where.exe cl
-
-          Write-Host ""
-          Write-Host "Compiler version:"
-          cl 2>&1 | Select-Object -First 3
-
-      # ==========================================
-      # 5. KIỂM TRA CMAKE
-      # ==========================================
-      - name: Check CMake
-        shell: pwsh
-        run: |
-          Write-Host "CMake version:"
-          cmake --version
-
-      # ==========================================
-      # 6. CONFIGURE CMAKE
-      # ==========================================
-      - name: Configure CMake
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "Configuring CMake..."
-          Write-Host "======================================"
-
-          if (Test-Path "build") {
-              Remove-Item "build" -Recurse -Force
+          if (!(Test-Path "CMakeLists.txt")) {
+            Write-Error "CMakeLists.txt not found"
+            exit 1
           }
 
-          # Không khóa Visual Studio 17.
-          # CMake sẽ tự chọn Visual Studio có sẵn trên runner.
+          if (!(Test-Path "Source")) {
+            Write-Error "Source folder not found"
+            exit 1
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: |
           cmake -S . -B build -A x64
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "CMake configuration failed!"
-              exit $LASTEXITCODE
-          }
-
-      # ==========================================
-      # 7. BUILD RELEASE
-      # ==========================================
-      - name: Build Release
+      - name: Build
         shell: pwsh
         run: |
-          Write-Host "======================================"
-          Write-Host "Building Release..."
-          Write-Host "======================================"
+          cmake --build build --config Release --parallel
 
-          cmake --build build `
-            --config Release `
-            --parallel
-
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Build failed!"
-              exit $LASTEXITCODE
-          }
-
-      # ==========================================
-      # 8. TÌM FILE EXE
-      # ==========================================
-      - name: Find generated EXE
+      - name: Find EXE
         shell: pwsh
         run: |
-          Write-Host "======================================"
-          Write-Host "Searching for generated EXE..."
-          Write-Host "======================================"
-
-          $exeFiles = Get-ChildItem `
-            -Path "build" `
-            -Filter "*.exe" `
-            -Recurse `
-            -File
-
-          if ($exeFiles.Count -eq 0) {
-              Write-Error "ERROR: No EXE file was generated!"
-              
-              Write-Host ""
-              Write-Host "Build directory contents:"
-              Get-ChildItem "build" -Recurse | Select-Object FullName
-
-              exit 1
-          }
-
-          Write-Host "EXE files found:"
-          $exeFiles | ForEach-Object {
-              Write-Host $_.FullName
-          }
-
-      # ==========================================
-      # 9. TẠO THƯ MỤC PACKAGE
-      # ==========================================
-      - name: Prepare package
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "Preparing package..."
-          Write-Host "======================================"
-
-          if (Test-Path "package") {
-              Remove-Item "package" -Recurse -Force
-          }
-
-          New-Item `
-            -ItemType Directory `
-            -Path "package" `
-            -Force | Out-Null
-
-      # ==========================================
-      # 10. COPY EXE
-      # ==========================================
-      - name: Copy application EXE
-        shell: pwsh
-        run: |
-          $exeFiles = Get-ChildItem `
-            -Path "build" `
-            -Filter "*.exe" `
-            -Recurse `
-            -File
-
-          if ($exeFiles.Count -eq 0) {
-              Write-Error "No EXE found!"
-              exit 1
-          }
-
-          # Bỏ qua uninstall.exe nếu có
-          $mainExe = $exeFiles |
-            Where-Object {
-              $_.Name -notmatch "uninstall"
-            } |
+          $exe = Get-ChildItem "build" -Filter "*.exe" -Recurse -File |
+            Where-Object { $_.Name -notmatch "uninstall" } |
             Select-Object -First 1
 
-          if ($null -eq $mainExe) {
-              Write-Error "Main application EXE not found!"
-              exit 1
+          if ($null -eq $exe) {
+            Write-Error "EXE was not generated"
+            exit 1
           }
 
-          Write-Host "Main EXE:"
-          Write-Host $mainExe.FullName
+          New-Item -ItemType Directory -Force "package" | Out-Null
 
-          Copy-Item `
-            $mainExe.FullName `
-            "package\HNStudio-Musik-AI.exe" `
-            -Force
+          Copy-Item $exe.FullName "package\HNStudio-Musik-AI.exe"
 
-      # ==========================================
-      # 11. COPY ASSETS
-      # ==========================================
       - name: Copy Assets
         shell: pwsh
         run: |
           if (Test-Path "Assets") {
-              Write-Host "Copying Assets..."
-
-              Copy-Item `
-                "Assets" `
-                "package\Assets" `
-                -Recurse `
-                -Force
-          } else {
-              Write-Host "No Assets folder found."
+            Copy-Item "Assets" "package\Assets" -Recurse -Force
           }
 
-      # ==========================================
-      # 12. COPY README
-      # ==========================================
-      - name: Copy README
-        shell: pwsh
-        run: |
-          if (Test-Path "README.md") {
-              Copy-Item `
-                "README.md" `
-                "package\README.md" `
-                -Force
-          }
-
-      # ==========================================
-      # 13. HIỂN THỊ PACKAGE
-      # ==========================================
-      - name: Verify package
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "Package contents:"
-          Write-Host "======================================"
-
-          Get-ChildItem `
-            "package" `
-            -Recurse |
-            Select-Object FullName, Length
-
-          if (!(Test-Path "package\HNStudio-Musik-AI.exe")) {
-              Write-Error "EXE is missing from package!"
-              exit 1
-          }
-
-      # ==========================================
-      # 14. ĐÓNG ZIP
-      # ==========================================
       - name: Create ZIP
         shell: pwsh
         run: |
-          Write-Host "======================================"
-          Write-Host "Creating ZIP..."
-          Write-Host "======================================"
-
-          $zip = "HNStudio-Musik-AI-Windows-x64.zip"
-
-          if (Test-Path $zip) {
-              Remove-Item $zip -Force
-          }
-
           Compress-Archive `
             -Path "package\*" `
-            -DestinationPath $zip `
-            -CompressionLevel Optimal
+            -DestinationPath "HNStudio-Musik-AI-Windows-x64.zip" `
+            -Force
 
-          if (!(Test-Path $zip)) {
-              Write-Error "ZIP creation failed!"
-              exit 1
-          }
-
-          $size = (Get-Item $zip).Length
-
-          Write-Host ""
-          Write-Host "ZIP CREATED SUCCESSFULLY"
-          Write-Host "File: $zip"
-          Write-Host "Size: $size bytes"
-
-      # ==========================================
-      # 15. UPLOAD ARTIFACT
-      # ==========================================
-      - name: Upload Windows ZIP
+      - name: Upload ZIP
         uses: actions/upload-artifact@v4
         with:
           name: HNStudio-Musik-AI-Windows-x64
           path: HNStudio-Musik-AI-Windows-x64.zip
-          if-no-files-found: error
-          retention-days: 30
-```
